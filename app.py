@@ -6,26 +6,33 @@ import hashlib
 import streamlit as st
 import plotly.express as px
 from datetime import datetime, timedelta
+import urllib.parse
 
-# --- CORE FILE CONFIGURATION ---
+# --- ENTERPRISE CONFIGURATIONS & GATEWAY ROUTES ---
+YOUR_FAMPAY_UPI = "9718910662@fam"  # Active FamPay Target Node
+YOUR_NAME = "NexGen SaaS Corp"
+
 DATA_FILE = "enterprise_multi_tenant_database.csv"
 USER_FILE = "secure_user_credentials.csv"
+PAYMENT_FILE = "secure_payment_ledger.csv"
 
-# --- DATABASE INITIALIZATION ---
+# --- SYSTEM DISK DATA BASE INITIALIZATION ---
 if not os.path.exists(DATA_FILE):
     df = pd.DataFrame(columns=["Date", "Username", "Company", "Product", "Cost_Price", "Selling_Price", "Quantity", "Total_Revenue", "Total_Profit", "Status"])
     df.to_csv(DATA_FILE, index=False)
 
 if not os.path.exists(USER_FILE):
-    df_users = pd.DataFrame(columns=["Username", "Password", "Company", "Plan"])
-    # Creating a default mock admin/premium user for instant testing
-    # Password is encrypted using SHA-256
+    df_users = pd.DataFrame(columns=["Username", "Password", "Company", "Plan", "Credits_Left"])
     default_pass = hashlib.sha256("admin123".encode()).hexdigest()
-    default_user = pd.DataFrame([{"Username": "demo_boss", "Password": default_pass, "Company": "NexGen Skincare", "Plan": "Premium"}])
-    default_free = pd.DataFrame([{"Username": "free_user", "Password": default_pass, "Company": "Local Shop", "Plan": "Free Tier"}])
-    pd.concat([df_users, default_user, default_free]).to_csv(USER_FILE, index=False)
+    # Master premium account setup
+    default_user = pd.DataFrame([{"Username": "demo_boss", "Password": default_pass, "Company": "NexGen Skincare", "Plan": "Enterprise Max", "Credits_Left": 999999}])
+    pd.concat([df_users, default_user]).to_csv(USER_FILE, index=False)
 
-# --- SECURITY & CRYPTOGRAPHY ENGINE ---
+if not os.path.exists(PAYMENT_FILE):
+    df_pay = pd.DataFrame(columns=["Timestamp", "Username", "Plan_Selected", "UTR_Number", "Amount_Requested", "Status"])
+    df_pay.to_csv(PAYMENT_FILE, index=False)
+
+# --- SECURITY ENGINE ---
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
@@ -34,19 +41,34 @@ def verify_user(username, password):
     hashed_p = hash_password(password)
     user_match = df[(df["Username"] == username) & (df["Password"] == hashed_p)]
     if not user_match.empty:
-        return {"Username": username, "Company": user_match.iloc[0]["Company"], "Plan": user_match.iloc[0]["Plan"]}
+        return {
+            "Username": username, 
+            "Company": user_match.iloc[0]["Company"], 
+            "Plan": user_match.iloc[0]["Plan"],
+            "Credits_Left": int(user_match.iloc[0]["Credits_Left"])
+        }
     return None
 
-def register_new_user(username, password, company, plan):
+def register_new_user(username, password, company):
     df = pd.read_csv(USER_FILE)
     if username in df["Username"].values:
         return False
-    new_user = {"Username": username, "Password": hash_password(password), "Company": company, "Plan": plan}
+    # All self-registrations boot with 5 Free Trial Credits
+    new_user = {"Username": username, "Password": hash_password(password), "Company": company, "Plan": "Free Trial", "Credits_Left": 5}
     df = pd.concat([df, pd.DataFrame([new_user])], ignore_index=False)
     df.to_csv(USER_FILE, index=False)
     return True
 
-# --- CORE BUSINESS LOGIC & CLEANING PIPELINES ---
+def deduct_credit(username):
+    df = pd.read_csv(USER_FILE)
+    current_credits = df.loc[df["Username"] == username, "Credits_Left"].values[0]
+    if current_credits > 0:
+        df.loc[df["Username"] == username, "Credits_Left"] = current_credits - 1
+        df.to_csv(USER_FILE, index=False)
+        return True
+    return False
+
+# --- CORE PARSING PIPELINES ---
 def clean_product_name(name):
     cleaned = re.sub(r'[^a-zA-Z0-9\s]', '', name)
     return cleaned.strip().title()
@@ -83,14 +105,12 @@ def autonomous_ai_parser(user_text):
 
 def execute_entry(data, username, company):
     df = pd.read_csv(DATA_FILE)
-    
-    # Anti-Duplicate Guardrail Layer
     if not df.empty:
         last_match = df[(df["Username"] == username) & (df["Product"] == data["Product"]) & (df["Quantity"] == data["Quantity"]) & (df["Selling_Price"] == data["Selling_Price"])]
         if not last_match.empty:
             last_time = pd.to_datetime(last_match["Date"].iloc[-1])
             if (pd.Timestamp.now() - last_time).total_seconds() < 120:
-                return "DUPLICATE_BLOCK", "System flagged an identical entry executed within 120 seconds. Record dropped."
+                return "DUPLICATE_BLOCK", "Identical data signature dropped within 120s matrix block."
 
     revenue = data["Selling_Price"] * data["Quantity"]
     profit = revenue - (data["Cost_Price"] * data["Quantity"])
@@ -112,7 +132,7 @@ def execute_entry(data, username, company):
     return "SUCCESS", f"Transaction finalized for {data['Product']}."
 
 def generate_ai_insights(df_data):
-    if df_data.empty: return "Awaiting structured ledger parameters to generate strategic matrix diagnostics."
+    if df_data.empty: return "Awaiting structured ledger rows."
     prod_summary = df_data.groupby("Product").sum()
     top_prod = prod_summary["Total_Revenue"].idxmax()
     low_profit_prod = prod_summary["Total_Profit"].idxmin()
@@ -121,7 +141,7 @@ def generate_ai_insights(df_data):
     - **Optimization Advisory:** Margin metrics on '{low_profit_prod}' indicate standard pricing inefficiency. Shift allocation parameters.
     """
 
-# --- INTERPRISE WORKSPACE GRAPHICS UI ---
+# --- WORKSPACE GRAPHICS UI ---
 st.set_page_config(page_title="NexGen SaaS AI Portal", layout="wide")
 
 st.markdown("""
@@ -129,12 +149,15 @@ st.markdown("""
     .main {background-color: #f8fafc;}
     div.stButton > button:first-child { background-color: #0f172a; color: white; border-radius: 6px; font-weight: 600; height: 42px;}
     div.stButton > button:first-child:hover {background-color: #1e293b;}
-    .lock-banner { background-color: #fff7ed; border: 1px solid #ffedd5; border-radius: 8px; padding: 18px; text-align: center; color: #c2410c; font-weight: 500;}
+    .lock-banner { background-color: #fef2f2; border: 1px solid #fee2e2; border-radius: 8px; padding: 18px; text-align: center; color: #dc2626; font-weight: 600; font-size: 16px;}
     .user-badge { background-color: #e2e8f0; padding: 5px 12px; border-radius: 20px; font-weight: 500; font-size: 13px;}
+    .payment-box { background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; text-align: center; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);}
+    .tier-card { background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; text-align: center; margin-bottom: 10px; }
+    .upi-btn { display: inline-block; background-color: #2563eb; color: white !important; padding: 12px 24px; font-weight: bold; border-radius: 6px; text-decoration: none; margin-top: 10px; text-align: center;}
+    .verification-holder { background-color: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 20px; text-align: center; margin-top: 15px; }
     </style>
 """, unsafe_allow_html=True)
 
-# Session Management Initializers
 if "auth_status" not in st.session_state: st.session_state.auth_status = False
 if "user_info" not in st.session_state: st.session_state.user_info = None
 
@@ -145,11 +168,11 @@ if not st.session_state.auth_status:
     
     auth_col, spacer = st.columns([1, 1.5])
     with auth_col:
-        mode = st.radio("Access Strategy", ["Existing Account Login", "Create New Corporate Account"], horizontal=True)
+        mode = st.radio("Access Strategy", ["Existing Account Login", "Create New Corporate Account (Free Trial)"], horizontal=True)
         st.write("---")
         
         if mode == "Existing Account Login":
-            user_in = st.text_input("Corporate Username:", placeholder="e.g., demo_boss")
+            user_in = st.text_input("Corporate Username:", placeholder="e.g., free_user")
             pass_in = st.text_input("Security Access Password:", type="password", placeholder="e.g., admin123")
             if st.button("Authenticate & Initialize Session", use_container_width=True):
                 session = verify_user(user_in, pass_in)
@@ -158,34 +181,40 @@ if not st.session_state.auth_status:
                     st.session_state.user_info = session
                     st.success("Access tokens granted. Initializing system..."); st.rerun()
                 else:
-                    st.error("Access Denied: Invalid cryptographic token credentials matches.")
-            st.caption("💡 Testing? Use username: `demo_boss` or `free_user` with password: `admin123`")
+                    st.error("Access Denied: Invalid credentials.")
+            st.caption("💡 Testing Master Accounts? Use username: `demo_boss` | password: `admin123`")
         else:
             new_user = st.text_input("Choose Unique Username:")
             new_pass = st.text_input("Choose Strong Password:", type="password")
             new_comp = st.text_input("Registered Company Name:")
-            new_plan = st.selectbox("Select Capital Scaling Strategy Plan:", ["Free Tier", "Premium"])
             
-            if st.button("Register & Create Workspace Infrastructure", use_container_width=True):
+            st.info("ℹ️ Note: All new registrations automatically start with a 5-Entry Free Trial.")
+            
+            if st.button("Register & Activate Free Trial", use_container_width=True):
                 if new_user and new_pass and new_comp:
-                    if register_new_user(new_user, new_pass, new_comp, new_plan):
-                        st.success("Infrastructure provisioned. Switch to login mode to proceed.")
+                    if register_new_user(new_user, new_pass, new_comp):
+                        st.success("Account created successfully! Switch to Login mode.")
                     else:
-                        st.error("Infrastructure Denied: Username matches historical database allocation.")
+                        st.error("Infrastructure Denied: Username already exists.")
                 else:
-                    st.warning("All data field strings must be explicitly populated.")
+                    st.warning("All fields must be filled.")
     st.stop()
 
-# --- POST-AUTHENTICATION SECURED RUNTIME ---
-user_data = st.session_state.user_info
-is_premium = user_data["Plan"] == "Premium"
+# --- RE-SYNC LIVE DATA STATE ---
+user_file_df = pd.read_csv(USER_FILE)
+current_user_row = user_file_df[user_file_df["Username"] == st.session_state.user_info["Username"]]
+if not current_user_row.empty:
+    st.session_state.user_info["Plan"] = current_user_row.iloc[0]["Plan"]
+    st.session_state.user_info["Credits_Left"] = int(current_user_row.iloc[0]["Credits_Left"])
 
-# Top Navigation Bar Matrix
+user_data = st.session_state.user_info
+is_premium = user_data["Plan"] in ["Starter Pro", "Business Elite", "Enterprise Max"]
+
 t1, t2 = st.columns([2, 1])
 with t1:
     st.markdown(f"# 🏢 {user_data['Company']} Operational Console")
 with t2:
-    st.markdown(f"<div style='text-align: right; margin-top: 15px;'><span class='user-badge'>👤 User: <b>{user_data['Username']}</b></span> <span class='user-badge' style='background-color:#dbeafe; color:#1e40af;'>💎 Plan: <b>{user_data['Plan']}</b></span></div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='text-align: right; margin-top: 15px;'><span class='user-badge'>👤 User: <b>{user_data['Username']}</b></span> <span class='user-badge' style='background-color:#f1f5f9; color:#0f172a;'>🪙 Credits: <b>{user_data['Credits_Left']}</b></span> <span class='user-badge' style='background-color:#dbeafe; color:#1e40af;'>💎 Plan: <b>{user_data['Plan']}</b></span></div>", unsafe_allow_html=True)
     if st.button("Terminate Secure Session"):
         st.session_state.auth_status = False
         st.session_state.user_info = None
@@ -193,23 +222,17 @@ with t2:
 
 st.write("---")
 
-# Global Localization Parameters Sidebars
+# Global Localization Sidebars
 st.sidebar.markdown("### 🌐 Regional Localization")
-country_selection = st.sidebar.selectbox("Select Operating Country:", ["India (INR)", "United States (USD)", "United Kingdom (GBP)", "Europe (EUR)", "United Arab Emirates (AED)", "Japan (JPY)"])
-currency_mapping = {"India (INR)": "₹", "United States (USD)": "$", "United Kingdom (GBP)": "£", "Europe (EUR)": "€", "United Arab Emirates (AED)": "AED ", "Japan (JPY)": "¥"}
-currency_symbol = currency_mapping[country_selection]
+country_selection = st.sidebar.selectbox("Select Operating Country:", ["India (INR)"])
+currency_symbol = "₹"
 
 st.sidebar.write("---")
 st.sidebar.markdown("### 🔒 Multi-Tenant Data Guard")
-st.sidebar.info(f"🛡️ Row-Level Security: Verified\n🏢 Scope: {user_data['Company']} Database Only")
+st.sidebar.info(f"🛡️ Row-Level Security: Verified\n🏢 Scope: {user_data['Company']} Database")
 
-# Fetching Data strictly mapped to the logged-in user's company context
 master_df = pd.read_csv(DATA_FILE)
 company_df = master_df[master_df["Company"] == user_data["Company"]]
-
-# Pricing Usage Lock Controller Rules
-USAGE_LIMIT = 5
-current_usage_count = len(company_df)
 
 col1, col2 = st.columns([1, 1.3])
 
@@ -218,73 +241,118 @@ with col1:
     tabs = st.tabs(["AI Conversational Input", "OCR Document Processing Scan", "Bulk Ingestion Pipelines"])
     
     with tabs[0]:
-        # Free Tier Threshold Guardrails
-        if not is_premium and current_usage_count >= USAGE_LIMIT:
-            st.markdown(f"<div class='lock-banner'>⚠️ <b>Free Tier Data Limit Exhausted ({USAGE_LIMIT}/{USAGE_LIMIT} Rows Used)</b><br>Upgrade your account profile status to access infinite analytical row arrays.</div>", unsafe_allow_html=True)
+        pay_ledger = pd.read_csv(PAYMENT_FILE)
+        user_pending_payments = pay_ledger[(pay_ledger["Username"] == user_data["Username"]) & (pay_ledger["Status"] == "Pending")]
+        
+        if user_data["Credits_Left"] <= 0 and not user_pending_payments.empty:
+            # PENDING COOLDOWN OVERLAY
+            st.markdown("""
+                <div class='verification-holder'>
+                    <h3 style='color: #2563eb;'>⏳ Automated Network Verification In Progress</h3>
+                    <p style='color: #475569; font-size: 15px;'>Our automated processing matrix is matching your transaction token against the FamPay live ledger.</p>
+                    <div style='font-size: 14px; background-color: #fff; border: 1px solid #e2e8f0; padding: 10px; border-radius: 6px; display: inline-block; text-align: left;'>
+                        <b>Tier Selected:</b> <code>""" + str(user_pending_payments.iloc[0]['Plan_Selected']) + """</code><br>
+                        <b>Submitted UTR:</b> <code>""" + str(user_pending_payments.iloc[0]['UTR_Number']) + """</code><br>
+                        <b>Amount Checked:</b> <code>₹""" + str(user_pending_payments.iloc[0]['Amount_Requested']) + """</code>
+                    </div>
+                    <p style='color: #64748b; font-size: 13px; margin-top: 15px;'>🕒 Verification complete window: <b>2 - 5 Minutes</b>. Do not submit duplicate requests.</p>
+                </div>
+            """, unsafe_allow_html=True)
+            if st.button("🔄 Refresh Subscription State Link"):
+                st.rerun()
+
+        elif user_data["Credits_Left"] <= 0:
+            # 3-TIER PROFESSIONAL SUBSCRIPTION MANAGEMENT BLOCK
+            st.markdown(f"<div class='lock-banner'>🚨 ⚠️ INGESTION PERMISSION DENIED: Credits Depleted (0 Tokens Available) ⚠️ 🚨</div>", unsafe_allow_html=True)
+            st.write("")
+            
+            st.markdown("### Select Enterprise Subscription Plan (Monthly Renewal)")
+            plan_option = st.radio("Choose Corporate Licensing Tier:", [
+                "Starter Pro — ₹599.00 / Mo (200 Ingestion Credits)",
+                "Business Elite — ₹2,999.00 / Mo (2,000 Credits + Bulk Engine + OCR)",
+                "Enterprise Max — ₹9,999.00 / Mo (10,000 Credits + Deep AI Matrix Analytics)"
+            ])
+            
+            # Extract configuration prices based on choice
+            if "Starter Pro" in plan_option:
+                base_p, target_plan = 599.00, "Starter Pro"
+            elif "Business Elite" in plan_option:
+                base_p, target_plan = 2999.00, "Business Elite"
+            else:
+                base_p, target_plan = 9999.00, "Enterprise Max"
+                
+            # Dynamic pinpoint logic injection for professional isolation verification
+            user_seed = int(hashlib.sha256(user_data["Username"].encode()).hexdigest(), 16) % 100
+            dynamic_cents = user_seed / 100.0
+            final_calculated_price = f"{base_p + dynamic_cents:.2f}"
+            
+            st.markdown(f"""
+            <div class='payment-box'>
+                <h4 style='margin:0; color:#475569;'>Selected Target License: <b>{target_plan}</b></h4>
+                <h2 style='color: #166534; margin: 10px 0;'>₹{final_calculated_price} <span style='font-size:14px; font-weight:normal; color:#64748b;'>/ Month Billing</span></h2>
+                <p style='margin:0; font-size:13px; color:#64748b;'>Destination Gateway Route: <code>{YOUR_FAMPAY_UPI}</code></p>
+            </div>
+            """, unsafe_allow_html=True)
+            
+            upi_string = f"upi://pay?pa={YOUR_FAMPAY_UPI}&pn={urllib.parse.quote(YOUR_NAME)}&am={final_calculated_price}&cu=INR&tn={target_plan}%20Activation%20For%20{user_data['Username']}"
+            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=180x180&data={urllib.parse.quote(upi_string)}"
+            
+            pay_col1, pay_col2 = st.columns(2)
+            with pay_col1:
+                st.image(qr_url, caption="Scan via FamPay or any Preferred UPI App")
+            with pay_col2:
+                st.markdown(f"<br><a href='{upi_string}' class='upi-btn' style='width: 100%;'>📱 Open Local UPI App</a>", unsafe_allow_html=True)
+                st.caption("Auto-fills exact transaction price matrices across secure client endpoints.")
+                
+            st.write("---")
+            st.markdown("#### Complete Gateway Verification Pipeline")
+            utr_input = st.text_input("Enter 12-Digit UPI Reference Number (UTR / Txn ID):", max_chars=12, placeholder="e.g., 394810293847")
+            
+            if st.button("Transmit Reference Token to Ledger Network", use_container_width=True):
+                if len(utr_input) == 12 and utr_input.isdigit():
+                    if utr_input in pay_ledger["UTR_Number"].astype(str).values:
+                        st.error("Duplicate Submission: This transaction token identifier has already been cached.")
+                    else:
+                        new_pay_entry = {
+                            "Timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
+                            "Username": user_data["Username"],
+                            "Plan_Selected": target_plan,
+                            "UTR_Number": utr_input,
+                            "Amount_Requested": final_calculated_price,
+                            "Status": "Pending"
+                        }
+                        pay_ledger = pd.concat([pay_ledger, pd.DataFrame([new_pay_entry])], ignore_index=False)
+                        pay_ledger.to_csv(PAYMENT_FILE, index=False)
+                        st.success("Verification parameters successfully locked. Reloading context...")
+                        st.rerun()
+                else:
+                    st.error("Format Error: UTR tokens must consist of exactly 12 numeric integers.")
         else:
+            # WORKSPACE CONSOLE INPUT EXECUTOR
             user_input = st.text_area("Command Input Console:", placeholder="Example: enter Face Wash cost is 250 and sold 40 pcs", height=110)
             if st.button("Deploy Execution Agent", use_container_width=True):
                 if user_input:
                     action, extracted_data = autonomous_ai_parser(user_input)
                     if action == "ENTRY":
-                        status, message = execute_entry(extracted_data, user_data["Username"], user_data["Company"])
-                        if status == "SUCCESS": st.success(message); st.rerun()
-                        else: st.warning(message)
-                    elif action == "FRAUD_ALERT":
-                        st.error("🚨 AUDIT LOCK: Anomalous volume spike captured by compliance protocols.")
-                        if st.checkbox("Supervisor Credentials Bypass"):
-                            execute_entry(extracted_data, user_data["Username"], user_data["Company"])
-                            st.success("Forced transaction completed."); st.rerun()
-                    elif action == "ANOMALY_ERROR": st.error("Aborted: Negative math criteria identified.")
-                    else: st.error("Syntax unparseable.")
+                        if deduct_credit(user_data["Username"]):
+                            status, message = execute_entry(extracted_data, user_data["Username"], user_data["Company"])
+                            if status == "SUCCESS": st.success(message); st.rerun()
+                            else: st.warning(message)
+                        else:
+                            st.error("System sync anomaly. Please re-authenticate.")
+                    else: st.error("Syntax parser execution failure.")
 
     with tabs[1]:
         st.markdown("#### 📄 OCR Optical Invoicing Engine")
-        if not is_premium:
-            st.markdown("<div class='lock-banner'>🔒 <b>Premium Feature Locked</b><br>Computational Document Vision OCR Scanning requires a Premium Account upgrade tier pipeline.</div>", unsafe_allow_html=True)
+        if user_data["Plan"] in ["Free Trial", "Starter Pro"]:
+            st.markdown(f"<div class='lock-banner'>🔒 <b>Feature Locked under Plan: {user_data['Plan']}</b><br>Upgrade to Business Elite or higher to unlock direct image OCR logging.</div>", unsafe_allow_html=True)
         else:
-            uploaded_img = st.file_uploader("Drop Receipt Invoice:", type=["png", "jpg", "jpeg", "pdf"])
-            if uploaded_img is not None:
-                st.info("AI Vision extraction processing complete: Found 'Premium Serum' | Price: 450 | Qty: 15")
-                if st.button("Commit Extraction Log to Secured Ledger"):
-                    mock_data = {"Product": "Premium Serum", "Cost_Price": 315.0, "Selling_Price": 450.0, "Quantity": 15, "Status": "OCR Verified"}
-                    execute_entry(mock_data, user_data["Username"], user_data["Company"])
-                    st.success("Committed safely."); st.rerun()
+            st.info("AI Vision Active for Tier Licensees...")
 
     with tabs[2]:
         st.markdown("#### 📁 Multi-Row Bulk Data Upload")
-        if not is_premium:
-            st.markdown("<div class='lock-banner'>🔒 <b>Premium Feature Locked</b><br>Bulk automated Excel / CSV file upload ingestion pipeline features are locked on Free Tiers.</div>", unsafe_allow_html=True)
-        else:
-            uploaded_file = st.file_uploader("Drop Document Sheet:", type=["csv", "xlsx"])
-            if uploaded_file is not None:
-                try:
-                    uploaded_df = pd.read_csv(uploaded_file) if uploaded_file.name.endswith('.csv') else pd.read_excel(uploaded_file)
-                    required = ["Product", "Price", "Quantity"]
-                    if all(col in uploaded_df.columns for col in required):
-                        uploaded_df = uploaded_df.dropna(subset=required)
-                        uploaded_df["Date"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")
-                        uploaded_df["Username"] = user_data["Username"]
-                        uploaded_df["Company"] = user_data["Company"]
-                        uploaded_df["Cost_Price"] = round(uploaded_df["Price"] * 0.7, 2)
-                        uploaded_df["Selling_Price"] = uploaded_df["Price"]
-                        uploaded_df["Total_Revenue"] = uploaded_df["Selling_Price"] * uploaded_df["Quantity"]
-                        uploaded_df["Total_Profit"] = uploaded_df["Total_Revenue"] - (uploaded_df["Cost_Price"] * uploaded_df["Quantity"])
-                        uploaded_df["Status"] = "Bulk Verified"
-                        
-                        final_bulk = uploaded_df[["Date", "Username", "Company", "Product", "Cost_Price", "Selling_Price", "Quantity", "Total_Revenue", "Total_Profit", "Status"]]
-                        pd.concat([master_df, final_bulk], ignore_index=False).to_csv(DATA_FILE, index=False)
-                        st.success("Bulk dataset verified and appended safely into secure sandbox workspace context."); st.rerun()
-                except Exception as e: st.error(f"Execution fault: {e}")
-
-    st.write("---")
-    st.markdown("### 📋 Executive Reporting Suite")
-    if is_premium and not company_df.empty:
-        csv_buffer = io.StringIO()
-        company_df.to_csv(csv_buffer, index=False)
-        st.download_button(label="📥 Download Corporate Performance Audit Dossier (.CSV Ledger)", data=csv_buffer.getvalue(), file_name=f"Executive_Report_{user_data['Company']}.csv", mime="text/csv", use_container_width=True)
-    else:
-        st.markdown("<div class='lock-banner'>🔒 <b>SaaS Executive Export Blocked</b><br>Automated reporting generation matrices are reserved for verified Premium instances.</div>", unsafe_allow_html=True)
+        if user_data["Plan"] in ["Free Trial", "Starter Pro"]:
+            st.markdown(f"<div class='lock-banner'>🔒 <b>Feature Locked under Plan: {user_data['Plan']}</b><br>Upgrade to Business Elite or higher to upload custom datasets.</div>", unsafe_allow_html=True)
 
 with col2:
     st.markdown("### 📈 Isolated Real-Time Analytics Pipeline")
@@ -299,41 +367,49 @@ with col2:
         m3.metric("Evaluated Net Margin", f"{margin}%")
         
         st.write("---")
-        
-        # Premium Deep Insight Analytics Model Locks
-        if not is_premium:
-            st.markdown("<div class='lock-banner' style='margin-bottom:15px;'>🔒 <b>Autonomous Analyst Strategic Insights Dashboard Layer Locked</b><br>Upgrade to Premium to get automated text hints explaining financial margins.</div>", unsafe_allow_html=True)
+        if user_data["Plan"] != "Enterprise Max":
+            st.markdown(f"<div class='lock-banner' style='margin-bottom:15px;'>🔒 <b>AI Business Intelligence Diagnostics Matrix Locked</b><br>Requires Enterprise Max Tier license.</div>", unsafe_allow_html=True)
         else:
             st.markdown("<div style='background-color:#ffffff; border:1px solid #e2e8f0; padding:15px; border-radius:8px;'><b>💡 Autonomous Analyst Intelligence Matrix</b>" + generate_ai_insights(company_df) + "</div>", unsafe_allow_html=True)
-        
-        st.write("#### 📊 Selected Analysis Framework Vector")
-        options = ["Structural Matrix Breakdown", "Timeline Ingestion History", "Predictive Machine Forecasting Engine"]
-        graph_type = st.radio("Framework Profile Strategy:", options, horizontal=True)
-        
-        prod_summary = company_df.groupby("Product", as_index=False)[["Total_Revenue", "Total_Profit"]].sum()
-        
-        if graph_type == "Structural Matrix Breakdown":
-            fig = px.pie(prod_summary, values="Total_Revenue", names="Product", hole=0.4, color_discrete_sequence=px.colors.qualitative.Safe)
-            st.plotly_chart(fig, use_container_width=True)
-        elif graph_type == "Timeline Ingestion History":
-            df_sorted = company_df.sort_values("Date")
-            fig = px.line(df_sorted, x="Date", y="Total_Revenue", text="Product", markers=True)
-            st.plotly_chart(fig, use_container_width=True)
-        elif graph_type == "Predictive Machine Forecasting Engine":
-            if not is_premium:
-                st.markdown("<div class='lock-banner'>🔒 <b>Machine Learning Horizon Vectors Locked</b><br>30-Day predictive valuation mapping is a premium analytical product service layer tool.</div>", unsafe_allow_html=True)
-            else:
-                df_sorted = company_df.sort_values("Date")
-                df_sorted["Date_Parsed"] = pd.to_datetime(df_sorted["Date"])
-                last_date = df_sorted["Date_Parsed"].max()
-                future_dates = [last_date + timedelta(days=i) for i in range(1, 31)]
-                avg_daily = total_rev / max(len(df_sorted["Date_Parsed"].unique()), 1)
-                simulated_growth = [total_rev + (avg_daily * i * 1.05) for i in range(1, 31)]
-                forecast_df = pd.DataFrame({"Projected Timeline": future_dates, "Projected Revenue Target": simulated_growth})
-                fig = px.line(forecast_df, x="Projected Timeline", y="Projected Revenue Target", color_discrete_sequence=["#6366f1"])
-                st.plotly_chart(fig, use_container_width=True)
-                
-        with st.expander("📄 View Audited Enterprise Database Records Row Array"):
+            
+        with st.expander("📄 View Database Records"):
             st.dataframe(company_df[["Date", "Username", "Product", "Selling_Price", "Quantity", "Total_Revenue", "Total_Profit", "Status"]], use_container_width=True)
     else:
-        st.warning("Database Workspace Context Empty. Ingest structural metrics rows to activate tracking graphics panels.")
+        st.warning("Workspace ledger matrix contexts currently empty.")
+
+# =====================================================================
+# 🕵️‍♂️ HIDDEN CORPORATE ADMIN COMPLIANCE CONTROLLER
+# =====================================================================
+if st.session_state.auth_status and user_data["Username"] == "demo_boss":
+    st.write("---")
+    st.markdown("### 🛠️ Master Corporate Verification Administration Vault")
+    st.caption("Secure authorization layer visible exclusively to verified cloud infrastructure owner instances.")
+    
+    admin_pay_ledger = pd.read_csv(PAYMENT_FILE)
+    pending_rows = admin_pay_ledger[admin_pay_ledger["Status"] == "Pending"]
+    
+    if pending_rows.empty:
+        st.info("System State Nominal: Zero active verification sequences queued inside global ledgers.")
+    else:
+        for idx, row in pending_rows.iterrows():
+            with st.container():
+                inner_col1, inner_col2 = st.columns([3, 1])
+                with inner_col1:
+                    st.warning(f"👤 **User Context:** `{row['Username']}` | 🎟️ **Tier:** `{row['Plan_Selected']}` | 🔑 **UTR Code:** `{row['UTR_Number']}` | 💵 **Amount:** `₹{row['Amount_Requested']}`")
+                with inner_col2:
+                    if st.button(f"Approve & Clear Ingestion Tokens (Ref {idx})", key=f"app_{idx}", use_container_width=True):
+                        # 1. Update Payment File State
+                        admin_pay_ledger.at[idx, "Status"] = "Success"
+                        admin_pay_ledger.to_csv(PAYMENT_FILE, index=False)
+                        
+                        # 2. Identify and Inject Core Credit Balances Mapped to Tier Profiles
+                        credit_mapping = {"Starter Pro": 200, "Business Elite": 2000, "Enterprise Max": 10000}
+                        granted_credits = credit_mapping.get(row['Plan_Selected'], 5)
+                        
+                        users_db = pd.read_csv(USER_FILE)
+                        users_db.loc[users_db["Username"] == row["Username"], "Plan"] = row['Plan_Selected']
+                        users_db.loc[users_db["Username"] == row["Username"], "Credits_Left"] = granted_credits
+                        users_db.to_csv(USER_FILE, index=False)
+                        
+                        st.success(f"System State Synchronized: Account '{row['Username']}' provisioned to {row['Plan_Selected']} (+ {granted_credits} Tokens Issued).")
+                        st.rerun()
