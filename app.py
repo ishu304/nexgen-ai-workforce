@@ -1,415 +1,686 @@
-import re
-import os
+"""
+main.py
+--------
+Personal Data Analyst Toolkit (Streamlit)
+
+This is a single-user, local, sellable tool — NOT a multi-tenant SaaS.
+There is no admin panel, no roles, no credits/plan system, because this
+app and its data live entirely on the buyer's own machine: anyone with
+the files has full control of them anyway, so building "access control"
+into a locally-run app can't actually be enforced. See README.md for the
+full explanation and monetization notes.
+
+Run with:
+    streamlit run main.py
+"""
+
 import io
-import pandas as pd
-import hashlib
-import streamlit as st
-import plotly.express as px
-from datetime import datetime, timedelta
+import json
+import platform
+import traceback
 import urllib.parse
 
-# --- ENTERPRISE CONFIGURATIONS & GATEWAY ROUTES ---
-YOUR_FAMPAY_UPI = "9718910662@fam"  # Active FamPay Target Node
-YOUR_NAME = "NexGen SaaS Corp"
+import streamlit as st
+import streamlit.components.v1 as components
+import pandas as pd
+import plotly.express as px
+from datetime import datetime
 
-DATA_FILE = "enterprise_multi_tenant_database.csv"
-USER_FILE = "secure_user_credentials.csv"
-PAYMENT_FILE = "secure_payment_ledger.csv"
+import data_handler as dh
+import security as sec
 
-# --- SYSTEM DISK DATA BASE INITIALIZATION ---
-if not os.path.exists(DATA_FILE):
-    df = pd.DataFrame(columns=["Date", "Username", "Company", "Product", "Cost_Price", "Selling_Price", "Quantity", "Total_Revenue", "Total_Profit", "Status"])
-    df.to_csv(DATA_FILE, index=False)
+# ----------------------------------------------------------------------
+# App / support config
+# ----------------------------------------------------------------------
+APP_VERSION = "1.0.0"
+SUPPORT_EMAIL = "feedback.ishupal@gmail.com"
 
-if not os.path.exists(USER_FILE):
-    df_users = pd.DataFrame(columns=["Username", "Password", "Company", "Plan", "Credits_Left"])
-    default_pass = hashlib.sha256("admin123".encode()).hexdigest()
-    # Master premium account setup
-    default_user = pd.DataFrame([{"Username": "demo_boss", "Password": default_pass, "Company": "NexGen Skincare", "Plan": "Enterprise Max", "Credits_Left": 999999}])
-    pd.concat([df_users, default_user]).to_csv(USER_FILE, index=False)
 
-if not os.path.exists(PAYMENT_FILE):
-    df_pay = pd.DataFrame(columns=["Timestamp", "Username", "Plan_Selected", "UTR_Number", "Amount_Requested", "Status"])
-    df_pay.to_csv(PAYMENT_FILE, index=False)
+def _diagnostic_lines() -> list:
+    """Basic, non-personal diagnostic info — no dataset or file content."""
+    return [
+        f"App Version: {APP_VERSION}",
+        f"Operating System: {platform.system()} {platform.release()}",
+        f"Python Version: {platform.python_version()}",
+    ]
 
-# --- SECURITY ENGINE ---
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
 
-def verify_user(username, password):
-    df = pd.read_csv(USER_FILE)
-    hashed_p = hash_password(password)
-    user_match = df[(df["Username"] == username) & (df["Password"] == hashed_p)]
-    if not user_match.empty:
-        return {
-            "Username": username, 
-            "Company": user_match.iloc[0]["Company"], 
-            "Plan": user_match.iloc[0]["Plan"],
-            "Credits_Left": int(user_match.iloc[0]["Credits_Left"])
-        }
-    return None
-
-def register_new_user(username, password, company):
-    df = pd.read_csv(USER_FILE)
-    if username in df["Username"].values:
-        return False
-    # All self-registrations boot with 5 Free Trial Credits
-    new_user = {"Username": username, "Password": hash_password(password), "Company": company, "Plan": "Free Trial", "Credits_Left": 5}
-    df = pd.concat([df, pd.DataFrame([new_user])], ignore_index=False)
-    df.to_csv(USER_FILE, index=False)
-    return True
-
-def deduct_credit(username):
-    df = pd.read_csv(USER_FILE)
-    current_credits = df.loc[df["Username"] == username, "Credits_Left"].values[0]
-    if current_credits > 0:
-        df.loc[df["Username"] == username, "Credits_Left"] = current_credits - 1
-        df.to_csv(USER_FILE, index=False)
-        return True
-    return False
-
-# --- CORE PARSING PIPELINES ---
-def clean_product_name(name):
-    cleaned = re.sub(r'[^a-zA-Z0-9\s]', '', name)
-    return cleaned.strip().title()
-
-def autonomous_ai_parser(user_text):
-    text = user_text.lower().strip()
-    price_match = re.search(r'(?:price|rs|rupee|rate|cost|is)\s*[:=-]?\s*(\d+)', text)
-    qty_match = re.search(r'(?:qty|quantity|items|sold|pcs|pack|pieces)\s*[:=-]?\s*(\d+)', text)
-    if not qty_match:
-        qty_match = re.search(r'(\d+)\s*(?:pcs|pack|items|quantity|pieces)', text)
-
-    product = "Standard Item"
-    if "enter" in text or "entry" in text:
-        try:
-            keyword = "enter" if "enter" in text else "entry"
-            product = text.split(keyword)[1]
-            if "price" in product: product = product.split("price")[0]
-            if "cost" in product: product = product.split("cost")[0]
-            if "is" in product: product = product.split("is")[0]
-        except:
-            pass
-
-    if price_match and qty_match:
-        final_product = clean_product_name(product)
-        selling_price = float(price_match.group(1))
-        quantity = int(qty_match.group(1))
-        
-        if selling_price <= 0 or quantity <= 0: return "ANOMALY_ERROR", None
-        if selling_price > 50000 or quantity > 5000:
-            return "FRAUD_ALERT", {"Product": final_product if final_product else "Suspicious Item", "Cost_Price": round(selling_price * 0.7, 2), "Selling_Price": selling_price, "Quantity": quantity, "Status": "Flagged"}
-            
-        return "ENTRY", {"Product": final_product if final_product else "Standard Item", "Cost_Price": round(selling_price * 0.7, 2), "Selling_Price": selling_price, "Quantity": quantity, "Status": "Verified"}
-    return "UNKNOWN", None
-
-def execute_entry(data, username, company):
-    df = pd.read_csv(DATA_FILE)
-    if not df.empty:
-        last_match = df[(df["Username"] == username) & (df["Product"] == data["Product"]) & (df["Quantity"] == data["Quantity"]) & (df["Selling_Price"] == data["Selling_Price"])]
-        if not last_match.empty:
-            last_time = pd.to_datetime(last_match["Date"].iloc[-1])
-            if (pd.Timestamp.now() - last_time).total_seconds() < 120:
-                return "DUPLICATE_BLOCK", "Identical data signature dropped within 120s matrix block."
-
-    revenue = data["Selling_Price"] * data["Quantity"]
-    profit = revenue - (data["Cost_Price"] * data["Quantity"])
-    
-    new_row = {
-        "Date": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
-        "Username": username,
-        "Company": company,
-        "Product": data["Product"],
-        "Cost_Price": data["Cost_Price"],
-        "Selling_Price": data["Selling_Price"],
-        "Quantity": data["Quantity"],
-        "Total_Revenue": revenue,
-        "Total_Profit": round(profit, 2),
-        "Status": data["Status"]
-    }
-    df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=False)
-    df.to_csv(DATA_FILE, index=False)
-    return "SUCCESS", f"Transaction finalized for {data['Product']}."
-
-def generate_ai_insights(df_data):
-    if df_data.empty: return "Awaiting structured ledger rows."
-    prod_summary = df_data.groupby("Product").sum()
-    top_prod = prod_summary["Total_Revenue"].idxmax()
-    low_profit_prod = prod_summary["Total_Profit"].idxmin()
-    return f"""
-    - **Top Revenue Vector:** Asset '{top_prod}' dictates core capital liquidity dynamics.
-    - **Optimization Advisory:** Margin metrics on '{low_profit_prod}' indicate standard pricing inefficiency. Shift allocation parameters.
+def build_feedback_mailto() -> str:
     """
+    Build a mailto: link that opens the user's default email app with the
+    support address, subject, and a pre-filled body template. Nothing here
+    is sent automatically — the user reviews and sends it themselves.
+    """
+    subject = f"ISHUPAL Feedback - {APP_VERSION}"
+    body_lines = _diagnostic_lines() + [
+        "",
+        "Feedback Type (Bug Report / Feature Request / General Feedback): ",
+        "Description: ",
+        "Steps to Reproduce (if applicable): ",
+    ]
+    body = "\n".join(body_lines)
+    query = urllib.parse.urlencode({"subject": subject, "body": body}, quote_via=urllib.parse.quote)
+    return f"mailto:{SUPPORT_EMAIL}?{query}"
 
-# --- WORKSPACE GRAPHICS UI ---
-st.set_page_config(page_title="NexGen SaaS AI Portal", layout="wide")
 
-st.markdown("""
-    <style>
-    .main {background-color: #f8fafc;}
-    div.stButton > button:first-child { background-color: #0f172a; color: white; border-radius: 6px; font-weight: 600; height: 42px;}
-    div.stButton > button:first-child:hover {background-color: #1e293b;}
-    .lock-banner { background-color: #fef2f2; border: 1px solid #fee2e2; border-radius: 8px; padding: 18px; text-align: center; color: #dc2626; font-weight: 600; font-size: 16px;}
-    .user-badge { background-color: #e2e8f0; padding: 5px 12px; border-radius: 20px; font-weight: 500; font-size: 13px;}
-    .payment-box { background-color: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; text-align: center; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);}
-    .tier-card { background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; text-align: center; margin-bottom: 10px; }
-    .upi-btn { display: inline-block; background-color: #2563eb; color: white !important; padding: 12px 24px; font-weight: bold; border-radius: 6px; text-decoration: none; margin-top: 10px; text-align: center;}
-    .verification-holder { background-color: #f8fafc; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 20px; text-align: center; margin-top: 15px; }
-    </style>
-""", unsafe_allow_html=True)
+def build_copy_text() -> str:
+    """
+    Text for the 'Copy Error Details' button: the latest captured app
+    error if one exists, otherwise just basic diagnostics. Never includes
+    dataset contents or other personal files.
+    """
+    lines = _diagnostic_lines()
+    last_error = st.session_state.get("last_error")
+    if last_error:
+        lines += ["", "Last Error:", last_error]
+    return "\n".join(lines)
 
-if "auth_status" not in st.session_state: st.session_state.auth_status = False
-if "user_info" not in st.session_state: st.session_state.user_info = None
 
-# --- AUTHENTICATION INTERFACE LAYER ---
-if not st.session_state.auth_status:
-    st.markdown("<h2 style='text-align: center; color: #0f172a; margin-top: 50px;'>🔐 NexGen Autonomous Enterprise AI Network</h2>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #64748b;'>Secure SaaS Portal • Multi-Tenant Accounting Isolation Engine</p>", unsafe_allow_html=True)
-    
-    auth_col, spacer = st.columns([1, 1.5])
-    with auth_col:
-        mode = st.radio("Access Strategy", ["Existing Account Login", "Create New Corporate Account (Free Trial)"], horizontal=True)
-        st.write("---")
-        
-        if mode == "Existing Account Login":
-            user_in = st.text_input("Corporate Username:", placeholder="e.g., free_user")
-            pass_in = st.text_input("Security Access Password:", type="password", placeholder="e.g., admin123")
-            if st.button("Authenticate & Initialize Session", use_container_width=True):
-                session = verify_user(user_in, pass_in)
-                if session:
-                    st.session_state.auth_status = True
-                    st.session_state.user_info = session
-                    st.success("Access tokens granted. Initializing system..."); st.rerun()
-                else:
-                    st.error("Access Denied: Invalid credentials.")
-            st.caption("💡 Testing Master Accounts? Use username: `demo_boss` | password: `admin123`")
-        else:
-            new_user = st.text_input("Choose Unique Username:")
-            new_pass = st.text_input("Choose Strong Password:", type="password")
-            new_comp = st.text_input("Registered Company Name:")
-            
-            st.info("ℹ️ Note: All new registrations automatically start with a 5-Entry Free Trial.")
-            
-            if st.button("Register & Activate Free Trial", use_container_width=True):
-                if new_user and new_pass and new_comp:
-                    if register_new_user(new_user, new_pass, new_comp):
-                        st.success("Account created successfully! Switch to Login mode.")
+def render_copy_error_button(label: str, text_to_copy: str, key: str, height: int = 46) -> None:
+    """
+    Renders a button that copies `text_to_copy` to the clipboard via the
+    browser Clipboard API. Implemented as a small embedded HTML/JS
+    component since Streamlit has no native clipboard-copy widget.
+    """
+    safe_text = json.dumps(text_to_copy)
+    safe_label = json.dumps(label)
+    html_code = f"""
+    <button id="{key}" style="
+        width:100%; padding:0.5rem 1.1rem; border:none; border-radius:8px;
+        font-weight:600; cursor:pointer; font-size:0.95rem;
+        background:linear-gradient(90deg, #16c98d, #00b4d8); color:white;">
+      {label}
+    </button>
+    <script>
+      const btn_{key} = document.getElementById("{key}");
+      btn_{key}.addEventListener("click", function() {{
+        navigator.clipboard.writeText({safe_text}).then(function() {{
+          btn_{key}.innerText = "✅ Copied!";
+          setTimeout(function() {{ btn_{key}.innerText = {safe_label}; }}, 1500);
+        }}).catch(function() {{
+          btn_{key}.innerText = "⚠️ Copy failed";
+          setTimeout(function() {{ btn_{key}.innerText = {safe_label}; }}, 1500);
+        }});
+      }});
+    </script>
+    """
+    components.html(html_code, height=height)
+
+# ----------------------------------------------------------------------
+# Page config + global style (dark neon theme, fixed text-contrast bug)
+# ----------------------------------------------------------------------
+st.set_page_config(
+    page_title="Data Analyst Toolkit",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+CUSTOM_CSS = """
+<style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+
+    :root {
+        --bg-deep: #0a0c14;
+        --bg-panel: #12162a;
+        --border-soft: #262b45;
+        --text-main: #e6e8f0;
+        --text-dim: #9aa0c0;
+        --accent-cyan: #00e0ff;
+        --accent-violet: #6a5cff;
+    }
+
+    .stApp {
+        background: radial-gradient(circle at top left, #101425 0%, #0a0c14 60%);
+        color: var(--text-main);
+    }
+
+    /* Force readable text color on every native Streamlit text element,
+       regardless of the browser/OS light-vs-dark override. This fixes
+       the "black text on black background" visibility bug. */
+    .stApp, .stApp p, .stApp span, .stApp label, .stApp div,
+    .stMarkdown, .stMarkdown p, .stMarkdown li,
+    .stText, .stCaption, .stAlert, .stMetric,
+    section[data-testid="stSidebar"] * ,
+    div[data-testid="stForm"] * ,
+    div[data-testid="stExpander"] * {
+        color: var(--text-main) !important;
+    }
+
+    /* Inputs: keep a light field background with dark, clearly visible text */
+    input, textarea,
+    div[data-baseweb="select"] * ,
+    div[data-baseweb="input"] * {
+        color: #0a0c14 !important;
+    }
+    div[data-baseweb="select"] > div,
+    input, textarea {
+        background-color: #eef0fb !important;
+        border-radius: 8px !important;
+    }
+
+    /* Dataframe / table text */
+    div[data-testid="stDataFrame"] * {
+        color: #0a0c14 !important;
+    }
+
+    section[data-testid="stSidebar"] {
+        background: #0d0f1a;
+        border-right: 1px solid var(--border-soft);
+    }
+
+    .app-title {
+        font-size: 1.6rem;
+        font-weight: 700;
+        background: linear-gradient(90deg, var(--accent-cyan), var(--accent-violet));
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0;
+    }
+
+    .app-subtitle {
+        color: var(--text-dim) !important;
+        font-size: 0.9rem;
+        margin-top: 0;
+    }
+
+    div[data-testid="stMetric"] {
+        background: linear-gradient(145deg, var(--bg-panel), var(--bg-deep));
+        border: 1px solid var(--border-soft);
+        border-radius: 14px;
+        padding: 16px 20px;
+    }
+    div[data-testid="stMetric"] label,
+    div[data-testid="stMetric"] div {
+        color: var(--text-main) !important;
+    }
+
+    .stButton > button {
+        background: linear-gradient(90deg, #00b4d8, var(--accent-violet));
+        color: white !important;
+        border: none;
+        border-radius: 8px;
+        font-weight: 600;
+        padding: 0.5rem 1.2rem;
+    }
+    .stButton > button:hover {
+        opacity: 0.9;
+        color: white !important;
+    }
+    .stDownloadButton > button {
+        background: linear-gradient(90deg, #16c98d, #00b4d8);
+        color: white !important;
+        border: none;
+        border-radius: 8px;
+        font-weight: 600;
+    }
+
+    div[data-testid="stExpander"] {
+        background: var(--bg-panel);
+        border: 1px solid var(--border-soft);
+        border-radius: 12px;
+    }
+
+    div[data-testid="stForm"] {
+        background: var(--bg-panel);
+        border: 1px solid var(--border-soft);
+        border-radius: 12px;
+        padding: 12px;
+    }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# ----------------------------------------------------------------------
+# Session state init
+# ----------------------------------------------------------------------
+for key, default in [
+    ("logged_in", False),
+    ("username", None),
+    ("page", "Dashboard"),
+    ("last_error", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+def logout():
+    st.session_state.logged_in = False
+    st.session_state.username = None
+    st.session_state.page = "Dashboard"
+
+
+# ----------------------------------------------------------------------
+# LOGIN / SETUP PAGE
+# ----------------------------------------------------------------------
+def render_login():
+    users = dh.load_users()
+    left, mid, right = st.columns([1, 1.1, 1])
+
+    with mid:
+        st.markdown(
+            "<div style='text-align:center; margin-top:60px;'>"
+            "<div class='app-title'>📊 Data Analyst Toolkit</div>"
+            "<p class='app-subtitle'>Your personal, local, offline data workspace</p>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.write("")
+
+        if not users:
+            # First-run setup — create the one local profile
+            with st.container(border=True):
+                st.subheader("Set up your local profile")
+                st.caption("This runs once. Your password is hashed and stored only on this machine.")
+                new_username = st.text_input("Choose a username")
+                new_name = st.text_input("Your name")
+                new_password = st.text_input("Choose a password", type="password")
+                if st.button("Create profile", use_container_width=True):
+                    if not new_username or not new_password:
+                        st.error("Username and password are required.")
                     else:
-                        st.error("Infrastructure Denied: Username already exists.")
+                        creds = sec.create_credentials(new_password)
+                        dh.create_local_profile(new_username, new_name or new_username, creds["password_hash"], creds["salt"])
+                        st.success("Profile created. Please log in below.")
+                        st.rerun()
+            return
+
+        with st.container(border=True):
+            st.subheader("Sign in")
+            username = st.text_input("Username", key="login_user")
+            password = st.text_input("Password", type="password", key="login_pass")
+            if st.button("Login", use_container_width=True):
+                user = dh.get_user(username)
+                if user is None:
+                    st.error("User not found.")
+                elif not sec.verify_password(password, user.get("salt", ""), user.get("password_hash", "")):
+                    st.error("Incorrect password.")
                 else:
-                    st.warning("All fields must be filled.")
-    st.stop()
+                    st.session_state.logged_in = True
+                    st.session_state.username = username
+                    st.session_state.page = "Dashboard"
+                    st.rerun()
 
-# --- RE-SYNC LIVE DATA STATE ---
-user_file_df = pd.read_csv(USER_FILE)
-current_user_row = user_file_df[user_file_df["Username"] == st.session_state.user_info["Username"]]
-if not current_user_row.empty:
-    st.session_state.user_info["Plan"] = current_user_row.iloc[0]["Plan"]
-    st.session_state.user_info["Credits_Left"] = int(current_user_row.iloc[0]["Credits_Left"])
 
-user_data = st.session_state.user_info
-is_premium = user_data["Plan"] in ["Starter Pro", "Business Elite", "Enterprise Max"]
+# ----------------------------------------------------------------------
+# SIDEBAR NAVIGATION
+# ----------------------------------------------------------------------
+def render_sidebar(user: dict):
+    st.sidebar.markdown(
+        "<div class='app-title' style='font-size:1.2rem;'>📊 Data Toolkit</div>",
+        unsafe_allow_html=True,
+    )
+    st.sidebar.markdown(f"**{user.get('name', st.session_state.username)}**")
+    st.sidebar.divider()
 
-t1, t2 = st.columns([2, 1])
-with t1:
-    st.markdown(f"# 🏢 {user_data['Company']} Operational Console")
-with t2:
-    st.markdown(f"<div style='text-align: right; margin-top: 15px;'><span class='user-badge'>👤 User: <b>{user_data['Username']}</b></span> <span class='user-badge' style='background-color:#f1f5f9; color:#0f172a;'>🪙 Credits: <b>{user_data['Credits_Left']}</b></span> <span class='user-badge' style='background-color:#dbeafe; color:#1e40af;'>💎 Plan: <b>{user_data['Plan']}</b></span></div>", unsafe_allow_html=True)
-    if st.button("Terminate Secure Session"):
-        st.session_state.auth_status = False
-        st.session_state.user_info = None
+    pages = ["Dashboard", "Analytics", "Data Entry", "Settings"]
+    for p in pages:
+        if st.sidebar.button(p, use_container_width=True, type="primary" if st.session_state.page == p else "secondary"):
+            st.session_state.page = p
+            st.rerun()
+
+    st.sidebar.divider()
+
+    # --- Freemium placeholders (inactive for now) ---
+    st.sidebar.button(
+        "⭐ Upgrade to Pro",
+        use_container_width=True,
+        disabled=True,
+        help="Pro features (Advanced Analytics, Cloud Auto-Backup, Team Features) are coming soon.",
+    )
+    st.sidebar.link_button(
+        "💬 Feedback / Support",
+        build_feedback_mailto(),
+        use_container_width=True,
+        help=f"Opens your email app, pre-addressed to {SUPPORT_EMAIL}",
+    )
+    with st.sidebar:
+        render_copy_error_button(
+            "📋 Copy Error Details",
+            build_copy_text(),
+            key="copy_error_btn",
+        )
+    st.sidebar.caption(f"v{APP_VERSION} · Free local edition")
+    with st.sidebar.expander("ℹ️ About"):
+        st.caption(
+            "Data Analyst Toolkit is a free, local-first data cleaning and "
+            "charting tool. Your data never leaves this machine — everything "
+            "is stored in local JSON files. No account, no cloud, no tracking."
+        )
+        st.caption(f"Support: {SUPPORT_EMAIL}")
+
+    st.sidebar.divider()
+    if st.sidebar.button("Logout", use_container_width=True):
+        logout()
         st.rerun()
 
-st.write("---")
 
-# Global Localization Sidebars
-st.sidebar.markdown("### 🌐 Regional Localization")
-country_selection = st.sidebar.selectbox("Select Operating Country:", ["India (INR)"])
-currency_symbol = "₹"
+# ----------------------------------------------------------------------
+# DASHBOARD PAGE
+# ----------------------------------------------------------------------
+def render_dashboard(user: dict):
+    st.markdown("<div class='app-title'>Dashboard Overview</div>", unsafe_allow_html=True)
+    st.markdown(f"<p class='app-subtitle'>Welcome back, {user.get('name')}</p>", unsafe_allow_html=True)
+    st.write("")
 
-st.sidebar.write("---")
-st.sidebar.markdown("### 🔒 Multi-Tenant Data Guard")
-st.sidebar.info(f"🛡️ Row-Level Security: Verified\n🏢 Scope: {user_data['Company']} Database")
+    datasets = dh.get_user_datasets(st.session_state.username)
+    total_rows = sum(d.get("rows", 0) for d in datasets)
+    last_upload = datasets[-1]["uploaded_at"] if datasets else "—"
 
-master_df = pd.read_csv(DATA_FILE)
-company_df = master_df[master_df["Company"] == user_data["Company"]]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Datasets Saved", len(datasets))
+    c2.metric("Total Rows Processed", f"{total_rows:,}")
+    c3.metric("Last Activity", last_upload)
 
-col1, col2 = st.columns([1, 1.3])
+    st.write("")
+    st.subheader("Your Datasets")
+    if not datasets:
+        st.info("No datasets yet. Go to **Analytics** to upload a file, or **Data Entry** to start typing data manually.")
+    else:
+        summary_rows = [
+            {
+                "File / Name": d["source_filename"],
+                "Uploaded": d["uploaded_at"],
+                "Rows": d["rows"],
+                "Columns": len(d["columns"]),
+            }
+            for d in datasets
+        ]
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-with col1:
-    st.markdown("### 🖥️ Autonomous Agent Control Terminal")
-    tabs = st.tabs(["AI Conversational Input", "OCR Document Processing Scan", "Bulk Ingestion Pipelines"])
-    
-    with tabs[0]:
-        pay_ledger = pd.read_csv(PAYMENT_FILE)
-        user_pending_payments = pay_ledger[(pay_ledger["Username"] == user_data["Username"]) & (pay_ledger["Status"] == "Pending")]
-        
-        if user_data["Credits_Left"] <= 0 and not user_pending_payments.empty:
-            # PENDING COOLDOWN OVERLAY
-            st.markdown("""
-                <div class='verification-holder'>
-                    <h3 style='color: #2563eb;'>⏳ Automated Network Verification In Progress</h3>
-                    <p style='color: #475569; font-size: 15px;'>Our automated processing matrix is matching your transaction token against the FamPay live ledger.</p>
-                    <div style='font-size: 14px; background-color: #fff; border: 1px solid #e2e8f0; padding: 10px; border-radius: 6px; display: inline-block; text-align: left;'>
-                        <b>Tier Selected:</b> <code>""" + str(user_pending_payments.iloc[0]['Plan_Selected']) + """</code><br>
-                        <b>Submitted UTR:</b> <code>""" + str(user_pending_payments.iloc[0]['UTR_Number']) + """</code><br>
-                        <b>Amount Checked:</b> <code>₹""" + str(user_pending_payments.iloc[0]['Amount_Requested']) + """</code>
-                    </div>
-                    <p style='color: #64748b; font-size: 13px; margin-top: 15px;'>🕒 Verification complete window: <b>2 - 5 Minutes</b>. Do not submit duplicate requests.</p>
-                </div>
-            """, unsafe_allow_html=True)
-            if st.button("🔄 Refresh Subscription State Link"):
+
+# ----------------------------------------------------------------------
+# ANALYTICS PAGE
+# ----------------------------------------------------------------------
+def render_analytics(user: dict):
+    st.markdown("<div class='app-title'>Analytics Engine</div>", unsafe_allow_html=True)
+    st.markdown("<p class='app-subtitle'>Upload, clean, merge, chart, and export your data</p>", unsafe_allow_html=True)
+    st.write("")
+
+    tab_upload, tab_merge = st.tabs(["📤 Upload & Clean", "🔗 Merge Multiple Files"])
+
+    with tab_upload:
+        uploaded_file = st.file_uploader("Upload CSV or Excel file", type=["csv", "xlsx", "xls"], key="single_upload")
+        if uploaded_file is not None:
+            try:
+                raw_df = dh.read_uploaded_file(uploaded_file)
+                st.write(f"Raw data: **{raw_df.shape[0]} rows × {raw_df.shape[1]} columns**")
+
+                cleaned_df = dh.clean_dataframe(raw_df)
+                st.success(
+                    f"Cleaning complete → {cleaned_df.shape[0]} rows remaining "
+                    f"({raw_df.shape[0] - cleaned_df.shape[0]} removed as null/duplicate rows)"
+                )
+
+                with st.expander("Preview cleaned data", expanded=True):
+                    st.dataframe(cleaned_df.head(50), use_container_width=True)
+
+                st.markdown("#### 🤖 Auto Insights")
+                with st.container(border=True):
+                    for point in dh.generate_insights(cleaned_df):
+                        st.markdown(f"- {point}")
+
+                col_a, col_b, col_c = st.columns(3)
+                if col_a.button("💾 Save cleaned dataset"):
+                    dh.save_processed_data(st.session_state.username, cleaned_df, uploaded_file.name)
+                    st.success("Dataset saved.")
+                    st.rerun()
+                col_b.download_button(
+                    "⬇️ Download as CSV",
+                    data=dh.df_to_csv_bytes(cleaned_df),
+                    file_name=f"cleaned_{uploaded_file.name.rsplit('.',1)[0]}.csv",
+                    mime="text/csv",
+                )
+                col_c.download_button(
+                    "⬇️ Download as Excel",
+                    data=dh.df_to_excel_bytes(cleaned_df),
+                    file_name=f"cleaned_{uploaded_file.name.rsplit('.',1)[0]}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+            except Exception as e:
+                st.error(f"Could not process file: {e}")
+
+    with tab_merge:
+        st.caption("Upload 2 or more files with similar columns to combine them into one dataset.")
+        merge_files = st.file_uploader(
+            "Upload multiple CSV/Excel files", type=["csv", "xlsx", "xls"],
+            accept_multiple_files=True, key="merge_upload"
+        )
+        merge_mode = st.radio(
+            "Merge mode", ["Stack rows (append)", "Side-by-side (join columns)"], horizontal=True
+        )
+        if merge_files and len(merge_files) >= 2:
+            try:
+                dfs = [dh.read_uploaded_file(f) for f in merge_files]
+                mode = "stack" if merge_mode.startswith("Stack") else "side_by_side"
+                merged = dh.merge_datasets(dfs, mode=mode)
+                cleaned_merged = dh.clean_dataframe(merged)
+                st.success(f"Merged {len(merge_files)} files → {cleaned_merged.shape[0]} rows, {cleaned_merged.shape[1]} columns")
+                st.dataframe(cleaned_merged.head(50), use_container_width=True)
+
+                merge_name = st.text_input("Name this merged dataset", value="merged_dataset")
+                if st.button("💾 Save merged dataset"):
+                    dh.save_processed_data(st.session_state.username, cleaned_merged, f"{merge_name}.csv")
+                    st.success("Merged dataset saved.")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Could not merge files: {e}")
+        elif merge_files:
+            st.info("Upload at least 2 files to merge.")
+
+    st.divider()
+    st.subheader("Build a Chart")
+
+    datasets = dh.get_user_datasets(st.session_state.username)
+    if not datasets:
+        st.info("Upload and save a dataset above to start charting.")
+        return
+
+    options = [f"{i+1}. {d['source_filename']} ({d['uploaded_at']})" for i, d in enumerate(datasets)]
+    choice = st.selectbox("Select a saved dataset", options)
+    idx = options.index(choice)
+    df = dh.dataset_to_dataframe(datasets[idx])
+
+    if df.empty:
+        st.warning("This dataset has no rows to chart.")
+        return
+
+    with st.expander("🤖 Auto Insights for this dataset"):
+        for point in dh.generate_insights(df):
+            st.markdown(f"- {point}")
+
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    all_cols = df.columns.tolist()
+
+    col1, col2, col3 = st.columns(3)
+    chart_type = col1.selectbox("Chart Type", ["Bar", "Pie", "Line", "Area"])
+    x_axis = col2.selectbox("X-axis / Category", all_cols)
+    y_axis = col3.selectbox("Y-axis / Value", numeric_cols if numeric_cols else all_cols)
+
+    dark_template = "plotly_dark"
+
+    # Aggregate by category so repeated labels sum/count instead of duplicating
+    chart_df = df.copy()
+    if y_axis in numeric_cols:
+        chart_df = chart_df.groupby(x_axis, as_index=False)[y_axis].sum()
+    else:
+        chart_df = chart_df.groupby(x_axis, as_index=False).size().rename(columns={"size": y_axis})
+    chart_df = chart_df.sort_values(y_axis, ascending=False)
+
+    unique_categories = chart_df[x_axis].nunique()
+
+    if chart_type in ("Bar", "Pie") and unique_categories > 12:
+        st.info(
+            f"'{x_axis}' has {unique_categories} unique values — showing only the top ones "
+            f"keeps the chart readable. Adjust below if needed."
+        )
+        top_n = st.slider("Show top N categories (rest grouped as 'Others')", 3, min(30, unique_categories), 10)
+        top_rows = chart_df.head(top_n)
+        rest_sum = chart_df.iloc[top_n:][y_axis].sum()
+        if rest_sum > 0:
+            others_row = pd.DataFrame({x_axis: ["Others"], y_axis: [rest_sum]})
+            chart_df = pd.concat([top_rows, others_row], ignore_index=True)
+        else:
+            chart_df = top_rows
+
+    try:
+        if chart_type == "Bar":
+            fig = px.bar(chart_df, x=x_axis, y=y_axis, template=dark_template, color=x_axis)
+        elif chart_type == "Pie":
+            fig = px.pie(chart_df, names=x_axis, values=y_axis, template=dark_template)
+        elif chart_type == "Line":
+            fig = px.line(chart_df, x=x_axis, y=y_axis, template=dark_template)
+        else:  # Area
+            fig = px.area(chart_df, x=x_axis, y=y_axis, template=dark_template)
+
+        fig.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font_color="#e6e8f0",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    except Exception as e:
+        st.error(f"Could not render chart: {e}")
+
+
+# ----------------------------------------------------------------------
+# DATA ENTRY PAGE — manual typing, no file needed
+# ----------------------------------------------------------------------
+def render_data_entry(user: dict):
+    st.markdown("<div class='app-title'>Data Entry</div>", unsafe_allow_html=True)
+    st.markdown("<p class='app-subtitle'>Type data in directly — add, edit, or delete rows by hand</p>", unsafe_allow_html=True)
+    st.write("")
+
+    datasets = dh.get_user_datasets(st.session_state.username)
+
+    with st.expander("➕ Start a brand-new dataset"):
+        new_name = st.text_input("Dataset name", value="my_data_entry")
+        cols_text = st.text_input("Column names (comma-separated)", value="Name, Value, Date")
+        if st.button("Create dataset"):
+            columns = [c.strip() for c in cols_text.split(",") if c.strip()]
+            if not columns:
+                st.error("Please provide at least one column name.")
+            else:
+                dh.create_blank_dataset(st.session_state.username, f"{new_name}.csv", columns)
+                st.success("Dataset created — select it below to start typing rows.")
                 st.rerun()
 
-        elif user_data["Credits_Left"] <= 0:
-            # 3-TIER PROFESSIONAL SUBSCRIPTION MANAGEMENT BLOCK
-            st.markdown(f"<div class='lock-banner'>🚨 ⚠️ INGESTION PERMISSION DENIED: Credits Depleted (0 Tokens Available) ⚠️ 🚨</div>", unsafe_allow_html=True)
-            st.write("")
-            
-            st.markdown("### Select Enterprise Subscription Plan (Monthly Renewal)")
-            plan_option = st.radio("Choose Corporate Licensing Tier:", [
-                "Starter Pro — ₹599.00 / Mo (200 Ingestion Credits)",
-                "Business Elite — ₹2,999.00 / Mo (2,000 Credits + Bulk Engine + OCR)",
-                "Enterprise Max — ₹9,999.00 / Mo (10,000 Credits + Deep AI Matrix Analytics)"
-            ])
-            
-            # Extract configuration prices based on choice
-            if "Starter Pro" in plan_option:
-                base_p, target_plan = 599.00, "Starter Pro"
-            elif "Business Elite" in plan_option:
-                base_p, target_plan = 2999.00, "Business Elite"
+    if not datasets:
+        st.info("No datasets yet — create one above.")
+        return
+
+    options = [f"{i+1}. {d['source_filename']}" for i, d in enumerate(datasets)]
+    choice = st.selectbox("Select a dataset to edit", options)
+    idx = options.index(choice)
+    record = datasets[idx]
+    df = dh.dataset_to_dataframe(record)
+    columns = record.get("columns", list(df.columns))
+
+    st.markdown("#### Add a new row")
+    with st.form("add_row_form", clear_on_submit=True):
+        new_row = {}
+        cols_ui = st.columns(min(len(columns), 4)) if columns else [st]
+        for i, col_name in enumerate(columns):
+            new_row[col_name] = cols_ui[i % len(cols_ui)].text_input(col_name, key=f"entry_{col_name}")
+        submitted = st.form_submit_button("Add row")
+        if submitted:
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+            dh.overwrite_dataset(st.session_state.username, idx, df)
+            st.success("Row added.")
+            st.rerun()
+
+    st.markdown("#### Existing rows")
+    if df.empty:
+        st.info("No rows yet — add one above.")
+    else:
+        edited_df = st.data_editor(
+            df, use_container_width=True, num_rows="dynamic", key=f"editor_{idx}"
+        )
+        col_save, col_export = st.columns(2)
+        if col_save.button("💾 Save changes"):
+            dh.overwrite_dataset(st.session_state.username, idx, edited_df)
+            st.success("Changes saved.")
+            st.rerun()
+        col_export.download_button(
+            "⬇️ Export this dataset (CSV)",
+            data=dh.df_to_csv_bytes(edited_df),
+            file_name=f"{record['source_filename'].rsplit('.',1)[0]}.csv",
+            mime="text/csv",
+        )
+
+
+# ----------------------------------------------------------------------
+# SETTINGS PAGE
+# ----------------------------------------------------------------------
+def render_settings(user: dict):
+    st.markdown("<div class='app-title'>Settings</div>", unsafe_allow_html=True)
+    st.markdown("<p class='app-subtitle'>Manage your local profile</p>", unsafe_allow_html=True)
+    st.write("")
+
+    with st.container(border=True):
+        st.subheader("Change password")
+        current_pw = st.text_input("Current password", type="password")
+        new_pw = st.text_input("New password", type="password")
+        confirm_pw = st.text_input("Confirm new password", type="password")
+        if st.button("Update password"):
+            if not sec.verify_password(current_pw, user.get("salt", ""), user.get("password_hash", "")):
+                st.error("Current password is incorrect.")
+            elif not new_pw or new_pw != confirm_pw:
+                st.error("New passwords don't match (or are empty).")
             else:
-                base_p, target_plan = 9999.00, "Enterprise Max"
-                
-            # Dynamic pinpoint logic injection for professional isolation verification
-            user_seed = int(hashlib.sha256(user_data["Username"].encode()).hexdigest(), 16) % 100
-            dynamic_cents = user_seed / 100.0
-            final_calculated_price = f"{base_p + dynamic_cents:.2f}"
-            
-            st.markdown(f"""
-            <div class='payment-box'>
-                <h4 style='margin:0; color:#475569;'>Selected Target License: <b>{target_plan}</b></h4>
-                <h2 style='color: #166534; margin: 10px 0;'>₹{final_calculated_price} <span style='font-size:14px; font-weight:normal; color:#64748b;'>/ Month Billing</span></h2>
-                <p style='margin:0; font-size:13px; color:#64748b;'>Destination Gateway Route: <code>{YOUR_FAMPAY_UPI}</code></p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            upi_string = f"upi://pay?pa={YOUR_FAMPAY_UPI}&pn={urllib.parse.quote(YOUR_NAME)}&am={final_calculated_price}&cu=INR&tn={target_plan}%20Activation%20For%20{user_data['Username']}"
-            qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=180x180&data={urllib.parse.quote(upi_string)}"
-            
-            pay_col1, pay_col2 = st.columns(2)
-            with pay_col1:
-                st.image(qr_url, caption="Scan via FamPay or any Preferred UPI App")
-            with pay_col2:
-                st.markdown(f"<br><a href='{upi_string}' class='upi-btn' style='width: 100%;'>📱 Open Local UPI App</a>", unsafe_allow_html=True)
-                st.caption("Auto-fills exact transaction price matrices across secure client endpoints.")
-                
-            st.write("---")
-            st.markdown("#### Complete Gateway Verification Pipeline")
-            utr_input = st.text_input("Enter 12-Digit UPI Reference Number (UTR / Txn ID):", max_chars=12, placeholder="e.g., 394810293847")
-            
-            if st.button("Transmit Reference Token to Ledger Network", use_container_width=True):
-                if len(utr_input) == 12 and utr_input.isdigit():
-                    if utr_input in pay_ledger["UTR_Number"].astype(str).values:
-                        st.error("Duplicate Submission: This transaction token identifier has already been cached.")
-                    else:
-                        new_pay_entry = {
-                            "Timestamp": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),
-                            "Username": user_data["Username"],
-                            "Plan_Selected": target_plan,
-                            "UTR_Number": utr_input,
-                            "Amount_Requested": final_calculated_price,
-                            "Status": "Pending"
-                        }
-                        pay_ledger = pd.concat([pay_ledger, pd.DataFrame([new_pay_entry])], ignore_index=False)
-                        pay_ledger.to_csv(PAYMENT_FILE, index=False)
-                        st.success("Verification parameters successfully locked. Reloading context...")
-                        st.rerun()
-                else:
-                    st.error("Format Error: UTR tokens must consist of exactly 12 numeric integers.")
+                creds = sec.create_credentials(new_pw)
+                dh.update_password(st.session_state.username, creds["salt"], creds["password_hash"])
+                st.success("Password updated.")
+
+    st.write("")
+    st.caption(
+        "All your data lives locally in the `data/` folder next to this app "
+        "(users.json, processed_data.json). Back it up by copying that folder."
+    )
+
+
+# ----------------------------------------------------------------------
+# APP ROUTER
+# ----------------------------------------------------------------------
+def main():
+    if not st.session_state.logged_in:
+        render_login()
+        return
+
+    user = dh.get_user(st.session_state.username)
+    if user is None:
+        logout()
+        st.rerun()
+        return
+
+    render_sidebar(user)
+
+    try:
+        if st.session_state.page == "Dashboard":
+            render_dashboard(user)
+        elif st.session_state.page == "Analytics":
+            render_analytics(user)
+        elif st.session_state.page == "Data Entry":
+            render_data_entry(user)
+        elif st.session_state.page == "Settings":
+            render_settings(user)
         else:
-            # WORKSPACE CONSOLE INPUT EXECUTOR
-            user_input = st.text_area("Command Input Console:", placeholder="Example: enter Face Wash cost is 250 and sold 40 pcs", height=110)
-            if st.button("Deploy Execution Agent", use_container_width=True):
-                if user_input:
-                    action, extracted_data = autonomous_ai_parser(user_input)
-                    if action == "ENTRY":
-                        if deduct_credit(user_data["Username"]):
-                            status, message = execute_entry(extracted_data, user_data["Username"], user_data["Company"])
-                            if status == "SUCCESS": st.success(message); st.rerun()
-                            else: st.warning(message)
-                        else:
-                            st.error("System sync anomaly. Please re-authenticate.")
-                    else: st.error("Syntax parser execution failure.")
+            render_dashboard(user)
+    except Exception:
+        tb = traceback.format_exc()
+        if st.session_state.get("last_error") != tb:
+            # First time we've seen this error: store it, then rerun once
+            # so the sidebar's "Copy Error Details" button picks it up.
+            st.session_state["last_error"] = tb
+            st.rerun()
+        st.error(
+            "⚠️ Something went wrong loading this page. Click "
+            "**📋 Copy Error Details** in the sidebar, then use "
+            "**💬 Feedback / Support** to send it to us."
+        )
 
-    with tabs[1]:
-        st.markdown("#### 📄 OCR Optical Invoicing Engine")
-        if user_data["Plan"] in ["Free Trial", "Starter Pro"]:
-            st.markdown(f"<div class='lock-banner'>🔒 <b>Feature Locked under Plan: {user_data['Plan']}</b><br>Upgrade to Business Elite or higher to unlock direct image OCR logging.</div>", unsafe_allow_html=True)
-        else:
-            st.info("AI Vision Active for Tier Licensees...")
 
-    with tabs[2]:
-        st.markdown("#### 📁 Multi-Row Bulk Data Upload")
-        if user_data["Plan"] in ["Free Trial", "Starter Pro"]:
-            st.markdown(f"<div class='lock-banner'>🔒 <b>Feature Locked under Plan: {user_data['Plan']}</b><br>Upgrade to Business Elite or higher to upload custom datasets.</div>", unsafe_allow_html=True)
-
-with col2:
-    st.markdown("### 📈 Isolated Real-Time Analytics Pipeline")
-    if not company_df.empty:
-        total_rev = company_df["Total_Revenue"].sum()
-        total_profit = company_df["Total_Profit"].sum()
-        margin = round((total_profit / total_rev) * 100, 2) if total_rev > 0 else 0
-        
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Gross Revenue Performance", f"{currency_symbol}{total_rev:,}")
-        m2.metric("Net Isolated Profit", f"{currency_symbol}{total_profit:,}")
-        m3.metric("Evaluated Net Margin", f"{margin}%")
-        
-        st.write("---")
-        if user_data["Plan"] != "Enterprise Max":
-            st.markdown(f"<div class='lock-banner' style='margin-bottom:15px;'>🔒 <b>AI Business Intelligence Diagnostics Matrix Locked</b><br>Requires Enterprise Max Tier license.</div>", unsafe_allow_html=True)
-        else:
-            st.markdown("<div style='background-color:#ffffff; border:1px solid #e2e8f0; padding:15px; border-radius:8px;'><b>💡 Autonomous Analyst Intelligence Matrix</b>" + generate_ai_insights(company_df) + "</div>", unsafe_allow_html=True)
-            
-        with st.expander("📄 View Database Records"):
-            st.dataframe(company_df[["Date", "Username", "Product", "Selling_Price", "Quantity", "Total_Revenue", "Total_Profit", "Status"]], use_container_width=True)
-    else:
-        st.warning("Workspace ledger matrix contexts currently empty.")
-
-# =====================================================================
-# 🕵️‍♂️ HIDDEN CORPORATE ADMIN COMPLIANCE CONTROLLER
-# =====================================================================
-if st.session_state.auth_status and user_data["Username"] == "demo_boss":
-    st.write("---")
-    st.markdown("### 🛠️ Master Corporate Verification Administration Vault")
-    st.caption("Secure authorization layer visible exclusively to verified cloud infrastructure owner instances.")
-    
-    admin_pay_ledger = pd.read_csv(PAYMENT_FILE)
-    pending_rows = admin_pay_ledger[admin_pay_ledger["Status"] == "Pending"]
-    
-    if pending_rows.empty:
-        st.info("System State Nominal: Zero active verification sequences queued inside global ledgers.")
-    else:
-        for idx, row in pending_rows.iterrows():
-            with st.container():
-                inner_col1, inner_col2 = st.columns([3, 1])
-                with inner_col1:
-                    st.warning(f"👤 **User Context:** `{row['Username']}` | 🎟️ **Tier:** `{row['Plan_Selected']}` | 🔑 **UTR Code:** `{row['UTR_Number']}` | 💵 **Amount:** `₹{row['Amount_Requested']}`")
-                with inner_col2:
-                    if st.button(f"Approve & Clear Ingestion Tokens (Ref {idx})", key=f"app_{idx}", use_container_width=True):
-                        # 1. Update Payment File State
-                        admin_pay_ledger.at[idx, "Status"] = "Success"
-                        admin_pay_ledger.to_csv(PAYMENT_FILE, index=False)
-                        
-                        # 2. Identify and Inject Core Credit Balances Mapped to Tier Profiles
-                        credit_mapping = {"Starter Pro": 200, "Business Elite": 2000, "Enterprise Max": 10000}
-                        granted_credits = credit_mapping.get(row['Plan_Selected'], 5)
-                        
-                        users_db = pd.read_csv(USER_FILE)
-                        users_db.loc[users_db["Username"] == row["Username"], "Plan"] = row['Plan_Selected']
-                        users_db.loc[users_db["Username"] == row["Username"], "Credits_Left"] = granted_credits
-                        users_db.to_csv(USER_FILE, index=False)
-                        
-                        st.success(f"System State Synchronized: Account '{row['Username']}' provisioned to {row['Plan_Selected']} (+ {granted_credits} Tokens Issued).")
-                        st.rerun()
+if __name__ == "__main__":
+    main()
